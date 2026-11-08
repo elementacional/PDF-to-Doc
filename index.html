@@ -655,95 +655,74 @@ select:focus,input:focus{border-color:var(--accent)}
 </div>
 
 <script id="v1010-counter-client">
-/* Contador global independente do pipeline PDF/OCR/DOCX.
-   Configure somente COUNTER_API_URL após publicar o Cloudflare Worker. */
-const COUNTER_API_URL = "https://SEU-WORKER.SEU-SUBDOMINIO.workers.dev";
+/* Contador público global via Count API; independente do pipeline PDF/OCR/DOCX.
+   A API não autentica eventos nem oferece deduplicação por ID.
+   Cada conversão concluída envia no máximo uma tentativa de incremento.
+   Falhas de rede não impedem converter ou baixar arquivos. */
 const GlobalConversionCounter = (() => {
-  const configured = /^https:\/\/[^\s/]+\.workers\.dev$/i.test(COUNTER_API_URL) &&
-    !COUNTER_API_URL.includes("SEU-WORKER") && !COUNTER_API_URL.includes("SEU-SUBDOMINIO");
+  const api = "https://countapi.mileshilliard.com/api/v1";
+  const counterKey = "elementacional-pdf-to-doc-engine-abnt-conversoes-v1010";
   const node = document.getElementById("globalCountNumber");
   const shell = document.getElementById("globalCounter");
-  const key = "pdfdocx.pending-conversions.v1";
-  const api = COUNTER_API_URL.replace(/\/$/, "");
-  let queue = [];
-  let sending = false;
-  let refreshPending = null;
-  try {
-    const stored = JSON.parse(localStorage.getItem(key) || "[]");
-    if(Array.isArray(stored)) queue = stored.filter(x => typeof x === "string" && /^[a-f0-9-]{36}$/i.test(x)).slice(-50);
-  } catch (_) { /* Armazenamento indisponível não impede o aplicativo. */ }
-  function persist() { try { localStorage.setItem(key, JSON.stringify(queue)); } catch (_) {} }
+  let requestInProgress = false;
+  let completedPending = 0;
+  let lastTotal = null;
+
   function show(total) {
-    if (Number.isSafeInteger(total) && total >= 0) {
-      node.textContent = total.toLocaleString("pt-BR");
-      shell.classList.remove("offline");
-      shell.title = "Total global de conversões DOCX concluídas";
-    }
+    if (!Number.isSafeInteger(total) || total < 0) return;
+    // Não retroceder durante atualizações simultâneas na mesma sessão.
+    lastTotal = lastTotal === null ? total : Math.max(lastTotal, total);
+    node.textContent = lastTotal.toLocaleString("pt-BR");
+    shell.classList.remove("offline");
+    shell.title = "Total público de conversões DOCX registradas (Count API)";
   }
   function unavailable(message) {
     shell.classList.add("offline");
     shell.title = message;
-    if (node.textContent === "—") node.textContent = "—"; // nunca inventar zero
+    if (lastTotal === null) node.textContent = "—";
   }
   async function refresh() {
-    if (!configured) { unavailable("Configure COUNTER_API_URL para ativar o contador global"); return; }
     try {
-      const response = await fetch(api + "/api/count", {method:"GET", cache:"no-store"});
+      const response = await fetch(api + "/get/" + encodeURIComponent(counterKey), {cache:"no-store"});
+      // Chave inexistente: nenhuma conversão foi registrada neste contador.
+      if (response.status === 404) { if (lastTotal === null) show(0); return; }
       if (!response.ok) throw new Error("HTTP " + response.status);
       const data = await response.json();
-      show(data.total);
-    } catch (_) { unavailable("Contador temporariamente indisponível; conversão continua funcionando"); }
-  }
-  function uuid() {
-    if (globalThis.crypto && typeof crypto.randomUUID === "function") return crypto.randomUUID();
-    if (globalThis.crypto && crypto.getRandomValues) {
-      const bytes = crypto.getRandomValues(new Uint8Array(16));
-      bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
-      const h = Array.from(bytes, b => b.toString(16).padStart(2,"0")).join("");
-      return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;
+      show(data.value);
+    } catch (_) {
+      unavailable("Contador temporariamente indisponível; conversão continua funcionando");
     }
-    return null;
   }
   async function flush() {
-    if (!configured || sending || queue.length === 0) return;
-    sending = true;
+    if (requestInProgress || completedPending === 0) return;
+    requestInProgress = true;
     try {
-      while(queue.length) {
-        const eventId = queue[0];
-        const response = await fetch(api + "/api/conversions", {
-          method:"POST", headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({eventId})
-        });
-        if(!response.ok) throw new Error("HTTP " + response.status);
-        const data = await response.json();
-        queue.shift(); persist();
-        show(data.total);
+      while (completedPending > 0) {
+        // Remover antes do envio: como o provedor não possui idempotência,
+        // jamais repetir uma requisição com confirmação perdida.
+        completedPending--;
+        try {
+          const response = await fetch(api + "/hit/" + encodeURIComponent(counterKey), {cache:"no-store"});
+          if (!response.ok) throw new Error("HTTP " + response.status);
+          const data = await response.json();
+          show(data.value);
+        } catch (_) {
+          unavailable("Registro não confirmado; não repetido para evitar duplicação");
+        }
       }
-    } catch (_) {
-      unavailable("Registro pendente: será reenviado na próxima abertura do aplicativo");
-    } finally { sending = false; }
+    } finally { requestInProgress = false; }
   }
   function completed() {
-    // Chamado somente depois de Packer.toBlob gerar um Blob não vazio.
-    if(!configured) return;
-    const eventId = uuid();
-    if(!eventId) return;
-    queue.push(eventId);
-    queue = queue.slice(-50);
-    persist();
+    // Chamado pelo motor somente após gerar um DOCX não vazio.
+    completedPending++;
     void flush();
   }
-  function init() {
-    void refresh();
-    void flush();
-    window.addEventListener("online", () => { void refresh(); void flush(); });
-    // Outras abas podem consultar o total atualizado quando voltarem ao foco.
-    document.addEventListener("visibilitychange", () => {
-      if(!document.hidden) { void refresh(); void flush(); }
-    });
-  }
-  init();
-  return {completed,refresh};
+  void refresh();
+  window.addEventListener("online", () => { void refresh(); });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) void refresh();
+  });
+  return {completed, refresh};
 })();
 </script>
 <script>
